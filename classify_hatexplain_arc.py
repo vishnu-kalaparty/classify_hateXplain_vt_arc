@@ -1,6 +1,7 @@
 import json
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Any
 
 import requests
@@ -20,8 +21,9 @@ DATA_DIR = os.path.join(PROJECT_ROOT, "HateXplain-master", "Data")
 DATASET_JSON = os.path.join(DATA_DIR, "dataset.json")
 
 DEFAULT_MAX_SAMPLES = -1  # -1 = all; >0 = cap
-DEFAULT_OUTPUT = "hatexplain_gpt_oss_120b_hate_normal_only.jsonl"
+DEFAULT_OUTPUT = "hatexplain_gpt_oss_120b_parallel_hate_normal_only.jsonl"
 DEFAULT_SLEEP_SECONDS = 0
+DEFAULT_NUM_THREADS = 5  # Number of threads for parallel API calls
 
 # START_INDEX: Set to resume from a specific index (0 = start fresh, >0 = resume/append)
 START_INDEX = 0
@@ -194,11 +196,48 @@ def extract_model_classification(response_text: str) -> str:
     return "Unknown"
 
 
+def _process_single_example(
+    example: Dict[str, Any],
+    idx: int,
+    total_examples: int,
+) -> Dict[str, Any]:
+    """
+    Process a single example: extract data, call API, and return the record.
+    This function is designed to be called from a thread pool.
+    """
+    text = get_post_text(example)
+    gold_label = get_gold_label(example)
+    annotator_labels, annotator_targets = get_annotator_labels_and_targets(example)
+    targets_union = get_targets_union(example)
+    prompt = PROMPT_TEMPLATE.format(input_text=text)
+
+    try:
+        response_text = call_vllm_completion(prompt)
+    except Exception as e:
+        response_text = f"ERROR: {e}"
+
+    pred_label = extract_model_classification(response_text)
+
+    record = {
+        "index": idx,
+        "id": example.get("id"),
+        "text": text,
+        "gold_label": gold_label,
+        "pred_label": pred_label,
+        "annotator_labels": annotator_labels,
+        "annotator_targets": annotator_targets,
+        "targets_union": targets_union,
+        "model_response": response_text,
+    }
+    return record
+
+
 def classify_hatexplain(
     max_samples: int,
     output_path: str,
     sleep_seconds: float = 0.0,
     start_index: int = 0,
+    num_threads: int = 5,
 ) -> None:
     """
     Run the LLM (vLLM completions) on HateXplain. Binary: Hateful vs Normal only.
@@ -207,6 +246,7 @@ def classify_hatexplain(
     max_samples: -1 = no limit; >0 = cap.
     start_index: Index to start from (0 = fresh start, >0 = resume/append mode).
                  When start_index > 0, files are appended to and metrics are skipped.
+    num_threads: Number of threads for parallel API calls (default 5).
     """
     examples_iter = load_hatexplain()
     examples_iter = [ex for ex in examples_iter if get_gold_label(ex) in ("Hateful", "Normal")]
@@ -226,6 +266,8 @@ def classify_hatexplain(
     else:
         print(f"Running on Hateful and Normal only: {total_examples} examples", flush=True)
 
+    print(f"Using {num_threads} threads for parallel API calls.", flush=True)
+
     num_examples = len(examples_iter)
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     errors_path = output_path.replace(".jsonl", "_errors.jsonl")
@@ -235,51 +277,57 @@ def classify_hatexplain(
 
     # Use append mode if resuming, write mode if starting fresh
     file_mode = "a" if start_index > 0 else "w"
-    
+
+    # Process examples in parallel using ThreadPoolExecutor
+    results: list[Dict[str, Any]] = []
+    completed_count = 0
+
+    with ThreadPoolExecutor(max_workers=num_threads) as executor:
+        # Submit all tasks
+        future_to_idx = {}
+        for i, example in enumerate(examples_iter):
+            idx = start_index + i if start_index > 0 else i
+            future = executor.submit(_process_single_example, example, idx, total_examples)
+            future_to_idx[future] = idx
+
+        # Collect results as they complete
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            try:
+                record = future.result()
+                results.append(record)
+            except Exception as e:
+                # Handle unexpected errors in the thread
+                results.append({
+                    "index": idx,
+                    "id": None,
+                    "text": "",
+                    "gold_label": "Unknown",
+                    "pred_label": "Unknown",
+                    "annotator_labels": [],
+                    "annotator_targets": [],
+                    "targets_union": [],
+                    "model_response": f"THREAD_ERROR: {e}",
+                })
+            completed_count += 1
+            print(f"[{completed_count}/{num_examples}] processed (index {idx})", flush=True)
+
+    # Sort results by index to maintain order in output file
+    results.sort(key=lambda r: r["index"])
+
+    # Write results to files
     with open(output_path, file_mode, encoding="utf-8") as fout, \
          open(errors_path, file_mode, encoding="utf-8") as ferr:
-        for i, example in enumerate(examples_iter):
-            # Calculate the actual index in the full dataset
-            idx = start_index + i if start_index > 0 else i
-            
-            text = get_post_text(example)
-            gold_label = get_gold_label(example)
-            annotator_labels, annotator_targets = get_annotator_labels_and_targets(example)
-            targets_union = get_targets_union(example)
-            prompt = PROMPT_TEMPLATE.format(input_text=text)
-
-            try:
-                response_text = call_vllm_completion(prompt)
-            except Exception as e:
-                response_text = f"ERROR: {e}"
-
-            pred_label = extract_model_classification(response_text)
-
-            record = {
-                "index": idx,
-                "id": example.get("id"),
-                "text": text,
-                "gold_label": gold_label,
-                "pred_label": pred_label,
-                "annotator_labels": annotator_labels,
-                "annotator_targets": annotator_targets,
-                "targets_union": targets_union,
-                "model_response": response_text,
-            }
+        for record in results:
             fout.write(json.dumps(record, indent=2, ensure_ascii=False) + "\n")
 
-            if pred_label == "Unknown":
+            if record["pred_label"] == "Unknown":
                 ferr.write(json.dumps(record, indent=2, ensure_ascii=False) + "\n")
                 error_count += 1
 
-            if pred_label in {"Hateful", "Normal"}:
-                gold_labels.append(gold_label)
-                pred_labels.append(pred_label)
-
-            print(f"[{idx + 1}/{total_examples}] processed", flush=True)
-
-            if sleep_seconds > 0:
-                time.sleep(sleep_seconds)
+            if record["pred_label"] in {"Hateful", "Normal"}:
+                gold_labels.append(record["gold_label"])
+                pred_labels.append(record["pred_label"])
 
     print(f"Saved classifications to {output_path}")
     if error_count > 0:
@@ -332,6 +380,7 @@ def main():
         output_path=DEFAULT_OUTPUT,
         sleep_seconds=DEFAULT_SLEEP_SECONDS,
         start_index=START_INDEX,
+        num_threads=DEFAULT_NUM_THREADS,
     )
 
 

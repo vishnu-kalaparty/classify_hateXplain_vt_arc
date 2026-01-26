@@ -279,10 +279,15 @@ def print_metrics(metrics: dict[str, Any], target_metrics: dict[str, Any], analy
         print(f"{g:>10} " + "  ".join(f"{v:>10}" for v in row))
     
     print(f"\n--- Target-Distributed Metrics ---")
-    print(f"{'Target':<25} {'Count':>8} {'Accuracy':>10} {'Macro F1':>10} {'Weighted F1':>12}")
-    print("-" * 70)
+    print(f"{'Ground Truth Counts':>48}")
+    print(f"{'Target':<25} {'Hateful':>10} {'Normal':>10} {'Hateful Recall':>18} {'Hateful F1':>11} {'Accuracy':>10} {'Macro F1':>10} {'Weighted F1':>12}")
+    print("-" * 112)
     for target, tmetrics in sorted(target_metrics.items(), key=lambda x: x[1]["count"], reverse=True):
-        print(f"{target:<25} {tmetrics['count']:>8} {tmetrics['accuracy']:>10.4f} {tmetrics['macro_f1']:>10.4f} {tmetrics['weighted_f1']:>12.4f}")
+        hateful_count = tmetrics['per_class'].get('Hateful', {}).get('support', 0)
+        normal_count = tmetrics['per_class'].get('Normal', {}).get('support', 0)
+        hateful_recall = tmetrics['per_class'].get('Hateful', {}).get('recall', 0.0)
+        hateful_f1 = tmetrics['per_class'].get('Hateful', {}).get('f1', 0.0)
+        print(f"{target:<25} {hateful_count:>10} {normal_count:>10} {hateful_recall:>15.4f} {hateful_f1:>13.4f} {tmetrics['accuracy']:>10.4f} {tmetrics['macro_f1']:>10.4f} {tmetrics['weighted_f1']:>12.4f}")
     
     print(f"\n--- Error Analysis ---")
     print(f"Unknown predictions:     {analysis['unknown_predictions']}")
