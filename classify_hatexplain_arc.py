@@ -5,7 +5,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Any
 
 import requests
+from dotenv import load_dotenv
 
+load_dotenv()
 
 API_KEY = os.environ.get("ARC_API_KEY")
 if API_KEY is None:
@@ -20,13 +22,27 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(PROJECT_ROOT, "HateXplain-master", "Data")
 DATASET_JSON = os.path.join(DATA_DIR, "dataset.json")
 
-DEFAULT_MAX_SAMPLES = -1  # -1 = all; >0 = cap
+DEFAULT_MAX_SAMPLES = 30  # -1 = all; >0 = cap
 DEFAULT_OUTPUT = "hatexplain_gpt_oss_120b_parallel_hate_normal_only.jsonl"
 DEFAULT_SLEEP_SECONDS = 0
 DEFAULT_NUM_THREADS = 5  # Number of threads for parallel API calls
 
 # START_INDEX: Set to resume from a specific index (0 = start fresh, >0 = resume/append)
 START_INDEX = 0
+
+# Few-shot prompting configuration
+ENABLE_FEW_SHOT = True  # Set to True to enable few-shot prompting
+FEW_SHOT_EXAMPLES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "few_shot_examples.json")
+
+# Bridge prompt that connects the base prompt with few-shot examples
+FEW_SHOT_BRIDGE_PROMPT = """
+---
+Here are some examples to guide your classification:
+
+{examples}
+
+Now, analyze the following text using the same approach:
+"""
 
 # HateXplain label mapping (need offensive for correct majority vote, then filter)
 LABEL_MAP_INT = {0: "Hateful", 1: "Normal", 2: "Offensive"}
@@ -56,6 +72,64 @@ RESPONSE FORMAT:
 2. Key phrases: [short quotes or "None"]
 3. Reasoning: [1–3 sentences explaining the classification, done by following the steps, citing any relevant evidence from the text.]
 """
+
+
+def load_few_shot_examples() -> list[dict]:
+    """
+    Load few-shot examples from the external JSON file.
+    Raises an error if the file is missing or empty.
+    """
+    if not os.path.exists(FEW_SHOT_EXAMPLES_FILE):
+        raise FileNotFoundError(
+            f"Few-shot examples file not found: {FEW_SHOT_EXAMPLES_FILE}. "
+            "Please create the file or disable few-shot prompting by setting ENABLE_FEW_SHOT = False."
+        )
+    
+    with open(FEW_SHOT_EXAMPLES_FILE, "r", encoding="utf-8") as f:
+        examples = json.load(f)
+    
+    if not examples:
+        raise ValueError(
+            f"Few-shot examples file is empty: {FEW_SHOT_EXAMPLES_FILE}. "
+            "Please add examples or disable few-shot prompting by setting ENABLE_FEW_SHOT = False."
+        )
+    
+    return examples
+
+
+def format_few_shot_examples(examples: list[dict]) -> str:
+    """
+    Format few-shot examples into a string for the prompt.
+    Expected format per example: {"text": "...", "classification": "Hateful" or "Normal"}
+    """
+    formatted_examples = []
+    for i, ex in enumerate(examples, 1):
+        text = ex.get("text", "")
+        classification = ex.get("classification", "")
+        formatted_examples.append(
+            f"Example {i}:\n"
+            f"Text: \"{text}\"\n"
+            f"Classification: {classification}"
+        )
+    return "\n\n".join(formatted_examples)
+
+
+def build_prompt(input_text: str, few_shot_examples: list[dict] | None = None) -> str:
+    """
+    Build the complete prompt for classification.
+    If few_shot_examples is provided, includes the bridge prompt with examples.
+    """
+    base_prompt = PROMPT_TEMPLATE.format(input_text=input_text)
+    
+    if few_shot_examples:
+        examples_str = format_few_shot_examples(few_shot_examples)
+        bridge = FEW_SHOT_BRIDGE_PROMPT.format(examples=examples_str)
+        # Insert bridge prompt before the INPUT TEXT section
+        parts = base_prompt.split("---\nINPUT TEXT:")
+        if len(parts) == 2:
+            return parts[0] + bridge + "---\nINPUT TEXT:" + parts[1]
+    
+    return base_prompt
 
 
 
@@ -200,6 +274,7 @@ def _process_single_example(
     example: Dict[str, Any],
     idx: int,
     total_examples: int,
+    few_shot_examples: list[dict] | None = None,
 ) -> Dict[str, Any]:
     """
     Process a single example: extract data, call API, and return the record.
@@ -209,7 +284,7 @@ def _process_single_example(
     gold_label = get_gold_label(example)
     annotator_labels, annotator_targets = get_annotator_labels_and_targets(example)
     targets_union = get_targets_union(example)
-    prompt = PROMPT_TEMPLATE.format(input_text=text)
+    prompt = build_prompt(text, few_shot_examples)
 
     try:
         response_text = call_vllm_completion(prompt)
@@ -228,6 +303,7 @@ def _process_single_example(
         "annotator_targets": annotator_targets,
         "targets_union": targets_union,
         "model_response": response_text,
+        "few_shot_enabled": few_shot_examples is not None,
     }
     return record
 
@@ -266,6 +342,14 @@ def classify_hatexplain(
     else:
         print(f"Running on Hateful and Normal only: {total_examples} examples", flush=True)
 
+    # Load few-shot examples if enabled
+    few_shot_examples = None
+    if ENABLE_FEW_SHOT:
+        few_shot_examples = load_few_shot_examples()
+        print(f"Few-shot prompting ENABLED with {len(few_shot_examples)} examples from {FEW_SHOT_EXAMPLES_FILE}", flush=True)
+    else:
+        print("Few-shot prompting DISABLED", flush=True)
+
     print(f"Using {num_threads} threads for parallel API calls.", flush=True)
 
     num_examples = len(examples_iter)
@@ -287,7 +371,7 @@ def classify_hatexplain(
         future_to_idx = {}
         for i, example in enumerate(examples_iter):
             idx = start_index + i if start_index > 0 else i
-            future = executor.submit(_process_single_example, example, idx, total_examples)
+            future = executor.submit(_process_single_example, example, idx, total_examples, few_shot_examples)
             future_to_idx[future] = idx
 
         # Collect results as they complete
