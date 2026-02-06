@@ -30,6 +30,9 @@ DEFAULT_NUM_THREADS = 5  # Number of threads for parallel API calls
 # START_INDEX: Set to resume from a specific index (0 = start fresh, >0 = resume/append)
 START_INDEX = 0
 
+# RUN_ERRORS_FILE: If True, load _errors.jsonl and re-run API only for those records, then merge back.
+RUN_ERRORS_FILE = False
+
 # Few-shot prompting configuration
 ENABLE_FEW_SHOT = True  # Set to True to enable few-shot prompting
 FEW_SHOT_EXAMPLES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "few_shot_examples.json")
@@ -250,13 +253,19 @@ def get_targets_union(example: Dict[str, Any]) -> list[str]:
 
 
 def extract_model_classification(response_text: str) -> str:
-    """Extract classification from text after <|message|> token."""
+    """
+    Extract classification from model response.
+    Handles both:
+    - vLLM format: text after <|message|> token, then "Classification: ..."
+    - GPT chat format (gpt-5-mini, gpt-4.1-mini): "1. Classification: Normal" or "1. Classification: [Hateful]" etc.
+    """
     text = response_text or ""
-    idx = text.rfind("<|message|>")
-    if idx == -1:
-        return "Unknown"
-    after = text[idx + len("<|message|>"):]
-    # Find "Classification:" and extract until newline
+    if "<|message|>" in text:
+        idx = text.rfind("<|message|>")
+        after = text[idx + len("<|message|>"):]
+    else:
+        after = text
+    # Find "Classification:" (case-insensitive) and extract value until newline
     c_idx = after.lower().find("classification:")
     if c_idx == -1:
         return "Unknown"
@@ -268,6 +277,134 @@ def extract_model_classification(response_text: str) -> str:
     if "normal" in label:
         return "Normal"
     return "Unknown"
+
+
+def _read_multi_line_jsonl(path: str) -> list[Dict[str, Any]]:
+    """Read a JSONL file where each record is multi-line (indent=2). Uses brace-counting."""
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read()
+    records = []
+    in_string = False
+    escape = False
+    depth = 0
+    start = 0
+    for j, c in enumerate(content):
+        if escape:
+            escape = False
+            continue
+        if c == "\\" and in_string:
+            escape = True
+            continue
+        if c == '"' and not escape:
+            in_string = not in_string
+            continue
+        if not in_string:
+            if c == "{":
+                if depth == 0:
+                    start = j
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    records.append(json.loads(content[start : j + 1]))
+    return records
+
+
+def load_errors_file(errors_path: str) -> list[Dict[str, Any]]:
+    """Load error records from a JSONL file (multi-line JSON per record, same format as main output)."""
+    return _read_multi_line_jsonl(errors_path)
+
+
+def _error_record_to_example(record: Dict[str, Any]) -> Dict[str, Any]:
+    """Build an example dict from an error-record so _process_single_example can use it."""
+    annotator_labels = record.get("annotator_labels") or []
+    annotator_targets = record.get("annotator_targets") or []
+    annotators = [
+        {"label": l, "target": t}
+        for l, t in zip(annotator_labels, annotator_targets)
+    ]
+    return {
+        "text": record.get("text", ""),
+        "id": record.get("id"),
+        "label": record.get("gold_label"),
+        "annotators": annotators,
+    }
+
+
+def retry_errors(
+    errors_path: str,
+    main_output_path: str,
+    num_threads: int = 5,
+    few_shot_examples: list[dict] | None = None,
+) -> None:
+    """
+    Load the errors file, re-run the API for each record, merge results back into the main
+    JSONL file, and write a new errors file containing only records still Unknown after retry.
+    """
+    if not os.path.isfile(errors_path):
+        print(f"Errors file not found: {errors_path}")
+        return
+    if not os.path.isfile(main_output_path):
+        print(f"Main output file not found: {main_output_path}")
+        return
+
+    records = load_errors_file(errors_path)
+    n = len(records)
+    print(f"Loaded {n} records from {errors_path}. Re-running API with {num_threads} threads.", flush=True)
+
+    examples = [_error_record_to_example(r) for r in records]
+    indices = [r["index"] for r in records]
+    results: list[Dict[str, Any]] = []
+    completed_count = 0
+
+    with ThreadPoolExecutor(max_workers=num_threads) as executor:
+        future_to_i = {}
+        for i, (example, idx) in enumerate(zip(examples, indices)):
+            future = executor.submit(_process_single_example, example, idx, n, few_shot_examples)
+            future_to_i[future] = i
+        for future in as_completed(future_to_i):
+            i = future_to_i[future]
+            try:
+                rec = future.result()
+                results.append(rec)
+            except Exception as e:
+                results.append({
+                    "index": indices[i],
+                    "id": records[i].get("id"),
+                    "text": records[i].get("text", ""),
+                    "gold_label": records[i].get("gold_label", "Unknown"),
+                    "pred_label": "Unknown",
+                    "annotator_labels": records[i].get("annotator_labels", []),
+                    "annotator_targets": records[i].get("annotator_targets", []),
+                    "targets_union": records[i].get("targets_union", []),
+                    "model_response": f"THREAD_ERROR: {e}",
+                })
+            completed_count += 1
+            print(f"[{completed_count}/{n}] retry processed (index {indices[i]})", flush=True)
+
+    results.sort(key=lambda r: r["index"])
+    retry_by_index = {r["index"]: r for r in results}
+
+    # Merge retry results back into main file: load all main records, replace by index, write back
+    print("Loading main output file for merge...", flush=True)
+    all_records = _read_multi_line_jsonl(main_output_path)
+    by_index = {r["index"]: r for r in all_records}
+    for idx, retry_rec in retry_by_index.items():
+        by_index[idx] = retry_rec
+    sorted_records = sorted(by_index.values(), key=lambda r: r["index"])
+    print(f"Writing merged main file ({len(sorted_records)} records)...", flush=True)
+    with open(main_output_path, "w", encoding="utf-8") as fout:
+        for r in sorted_records:
+            fout.write(json.dumps(r, indent=2, ensure_ascii=False) + "\n")
+
+    # Write new errors file: only records still Unknown after retry
+    still_unknown = [r for r in results if r.get("pred_label") == "Unknown"]
+    with open(errors_path, "w", encoding="utf-8") as ferr:
+        for r in still_unknown:
+            ferr.write(json.dumps(r, indent=2, ensure_ascii=False) + "\n")
+
+    print(f"Updated main file: {main_output_path}")
+    print(f"Retry fixed {n - len(still_unknown)} records. {len(still_unknown)} still unknown -> {errors_path}")
 
 
 def _process_single_example(
@@ -347,6 +484,13 @@ def classify_hatexplain(
     if ENABLE_FEW_SHOT:
         few_shot_examples = load_few_shot_examples()
         print(f"Few-shot prompting ENABLED with {len(few_shot_examples)} examples from {FEW_SHOT_EXAMPLES_FILE}", flush=True)
+        # Exclude few-shot example texts from classification and output
+        few_shot_texts = {ex.get("text", "").strip() for ex in few_shot_examples}
+        n_before = len(examples_iter)
+        examples_iter = [ex for ex in examples_iter if get_post_text(ex).strip() not in few_shot_texts]
+        skipped = n_before - len(examples_iter)
+        if skipped:
+            print(f"Skipped {skipped} examples that are in the few-shot prompt (not classified or written to output).", flush=True)
     else:
         print("Few-shot prompting DISABLED", flush=True)
 
@@ -459,13 +603,26 @@ def classify_hatexplain(
 
 
 def main():
-    classify_hatexplain(
-        max_samples=DEFAULT_MAX_SAMPLES,
-        output_path=DEFAULT_OUTPUT,
-        sleep_seconds=DEFAULT_SLEEP_SECONDS,
-        start_index=START_INDEX,
-        num_threads=DEFAULT_NUM_THREADS,
-    )
+    if RUN_ERRORS_FILE:
+        errors_path = DEFAULT_OUTPUT.replace(".jsonl", "_errors.jsonl")
+        few_shot_examples = None
+        if ENABLE_FEW_SHOT:
+            few_shot_examples = load_few_shot_examples()
+            print(f"Few-shot ENABLED for retry ({len(few_shot_examples)} examples)", flush=True)
+        retry_errors(
+            errors_path=errors_path,
+            main_output_path=DEFAULT_OUTPUT,
+            num_threads=DEFAULT_NUM_THREADS,
+            few_shot_examples=few_shot_examples,
+        )
+    else:
+        classify_hatexplain(
+            max_samples=DEFAULT_MAX_SAMPLES,
+            output_path=DEFAULT_OUTPUT,
+            sleep_seconds=DEFAULT_SLEEP_SECONDS,
+            start_index=START_INDEX,
+            num_threads=DEFAULT_NUM_THREADS,
+        )
 
 
 if __name__ == "__main__":
