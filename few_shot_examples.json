@@ -1,10 +1,26 @@
 [
-    {
-        "text": "I absolutely despise this group of people, they are the scum of the earth and should be removed.",
-        "classification": "Hateful"
-    },
-    {
-        "text": "I really didn't like the movie, the plot was boring and the acting was terrible.",
-        "classification": "Normal"
-    }
+  {
+    "text": "<user> i am bit confused coz chinese ppl can not access twitter thn how this ching chong using it i think he pakistani 🤔 🤔 🤔",
+    "classification": "Hateful"
+  },
+  {
+    "text": "this bitch in whataburger eating a burger with no top bun and holding it palm up i hate white bitches",
+    "classification": "Hateful"
+  },
+  {
+    "text": "laura loomer raped me while screaming at me in her disgusting kike language and said we must exterminate the goyim laura loomer loomergate",
+    "classification": "Hateful"
+  },
+  {
+    "text": "i dont think im getting my baby them white 9 he has two white j and nikes not even touched",
+    "classification": "Normal"
+  },
+  {
+    "text": "nawt yall niggers ignoring me",
+    "classification": "Normal"
+  },
+  {
+    "text": "italian niggas call they dick the poozingi",
+    "classification": "Normal"
+  }
 ]
